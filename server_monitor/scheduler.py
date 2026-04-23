@@ -1,11 +1,12 @@
 """数据采集调度器"""
 
 import logging
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .collector import SystemMetricsCollector
-from .database import settings
+from .database import settings, SessionLocal, Server
 
 logger = logging.getLogger(__name__)
 
@@ -18,17 +19,59 @@ class MetricsScheduler:
         self.collector = SystemMetricsCollector()
         self.is_running = False
 
+    def _collect_all_servers(self):
+        """采集所有已启用服务器的指标"""
+        db = SessionLocal()
+        try:
+            enabled_servers = db.query(Server).filter(Server.is_enabled == True).all()
+            
+            for server in enabled_servers:
+                try:
+                    success, metrics = self.collector.collect_remote(server)
+                    
+                    if success and metrics:
+                        self.collector.save_to_database(metrics)
+                        
+                        server.status = "online"
+                        server.last_seen = datetime.utcnow()
+                        
+                        logger.info(
+                            f"远程指标采集成功 - 主机: {server.hostname} ({server.ip_address}), "
+                            f"CPU: {metrics['cpu_usage']:.1f}%, "
+                            f"内存: {metrics['memory_usage']:.1f}%"
+                        )
+                    else:
+                        server.status = "offline"
+                        logger.warning(f"远程指标采集失败 - 主机: {server.hostname} ({server.ip_address})")
+                    
+                    db.commit()
+                    
+                except Exception as e:
+                    server.status = "offline"
+                    db.commit()
+                    logger.error(f"采集服务器 {server.hostname} 指标时发生错误: {str(e)}")
+            
+            try:
+                local_metrics = self.collector.collect_and_save_local()
+                logger.info(
+                    f"本地指标采集成功 - 主机: {local_metrics['hostname']}, "
+                    f"CPU: {local_metrics['cpu_usage']:.1f}%, "
+                    f"内存: {local_metrics['memory_usage']:.1f}%"
+                )
+            except Exception as e:
+                logger.error(f"采集本地指标时发生错误: {str(e)}")
+                
+        except Exception as e:
+            logger.error(f"采集所有服务器指标时发生错误: {str(e)}")
+        finally:
+            db.close()
+
     def _collect_job(self):
         """定时采集任务"""
         try:
-            metrics = self.collector.collect_and_save()
-            logger.info(
-                f"指标采集成功 - 主机: {metrics['hostname']}, "
-                f"CPU: {metrics['cpu_usage']:.1f}%, "
-                f"内存: {metrics['memory_usage']:.1f}%"
-            )
+            self._collect_all_servers()
         except Exception as e:
-            logger.error(f"指标采集失败: {str(e)}")
+            logger.error(f"定时采集任务失败: {str(e)}")
 
     def start(self, interval_seconds: int = None):
         """启动调度器
@@ -70,3 +113,7 @@ class MetricsScheduler:
         """立即执行一次采集"""
         logger.info("执行立即采集")
         self._collect_job()
+
+    def refresh_servers(self):
+        """刷新服务器列表（重新从数据库加载）"""
+        logger.info("刷新服务器列表")
