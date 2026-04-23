@@ -425,3 +425,416 @@ def disable_server(
     db.refresh(server)
     
     return server
+
+
+class AgentRegisterRequest(BaseModel):
+    """Agent注册请求"""
+    hostname: str
+    ip_address: str
+    name: Optional[str] = None
+    agent_version: str = "1.0.0"
+    description: Optional[str] = None
+
+
+class AgentRegisterResponse(BaseModel):
+    """Agent注册响应"""
+    server_id: int
+    hostname: str
+    status: str
+    message: str
+
+
+class AgentMetricsPush(BaseModel):
+    """Agent推送指标请求"""
+    hostname: str
+    timestamp: datetime
+    cpu_usage: float
+    memory_total: float
+    memory_available: float
+    memory_used: float
+    memory_usage: float
+    
+    load1: Optional[float] = None
+    load5: Optional[float] = None
+    load15: Optional[float] = None
+
+
+class AgentMetricsResponse(BaseModel):
+    """Agent推送指标响应"""
+    status: str
+    message: str
+    received_at: datetime
+
+
+@app.post("/api/agent/register", response_model=AgentRegisterResponse, status_code=201)
+def agent_register(
+    request: AgentRegisterRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Agent自动注册接口（Push模式）
+    
+    Agent启动时自动调用此接口注册服务器。
+    如果主机名已存在，则更新服务器信息；否则创建新服务器。
+    
+    - **hostname**: 服务器主机名（唯一标识）
+    - **ip_address**: 服务器IP地址
+    - **name**: 服务器显示名称（可选）
+    - **agent_version**: Agent版本
+    - **description**: 服务器描述（可选）
+    """
+    existing_server = db.query(Server).filter(Server.hostname == request.hostname).first()
+    
+    if existing_server:
+        existing_server.ip_address = request.ip_address
+        existing_server.status = "online"
+        existing_server.last_seen = datetime.utcnow()
+        existing_server.is_enabled = True
+        if request.name:
+            existing_server.name = request.name
+        if request.description:
+            existing_server.description = request.description
+        
+        db.commit()
+        db.refresh(existing_server)
+        
+        return AgentRegisterResponse(
+            server_id=existing_server.id,
+            hostname=existing_server.hostname,
+            status="updated",
+            message="服务器已更新"
+        )
+    
+    new_server = Server(
+        hostname=request.hostname,
+        name=request.name or request.hostname,
+        ip_address=request.ip_address,
+        port=0,
+        metrics_path="/agent-push",
+        is_enabled=True,
+        status="online",
+        last_seen=datetime.utcnow(),
+        description=request.description or f"Agent注册 - {request.agent_version}"
+    )
+    
+    db.add(new_server)
+    db.commit()
+    db.refresh(new_server)
+    
+    return AgentRegisterResponse(
+        server_id=new_server.id,
+        hostname=new_server.hostname,
+        status="registered",
+        message="服务器注册成功"
+    )
+
+
+@app.post("/api/agent/metrics", response_model=AgentMetricsResponse)
+def agent_push_metrics(
+    request: AgentMetricsPush,
+    db: Session = Depends(get_db)
+):
+    """
+    Agent推送指标接口（Push模式）
+    
+    Agent每分钟调用此接口推送系统指标。
+    
+    - **hostname**: 服务器主机名
+    - **timestamp**: 指标采集时间
+    - **cpu_usage**: CPU使用率（百分比）
+    - **memory_total**: 总内存（字节）
+    - **memory_available**: 可用内存（字节）
+    - **memory_used**: 已用内存（字节）
+    - **memory_usage**: 内存使用率（百分比）
+    - **load1/5/15**: 系统负载（可选）
+    """
+    server = db.query(Server).filter(Server.hostname == request.hostname).first()
+    
+    if not server:
+        raise HTTPException(
+            status_code=404,
+            detail=f"服务器 {request.hostname} 未注册，请先调用 /api/agent/register 注册"
+        )
+    
+    metric_record = SystemMetric(
+        hostname=request.hostname,
+        timestamp=request.timestamp,
+        cpu_usage=request.cpu_usage,
+        memory_total=request.memory_total,
+        memory_available=request.memory_available,
+        memory_used=request.memory_used,
+        memory_usage=request.memory_usage
+    )
+    db.add(metric_record)
+    
+    server.status = "online"
+    server.last_seen = datetime.utcnow()
+    db.commit()
+    
+    return AgentMetricsResponse(
+        status="success",
+        message="指标已接收",
+        received_at=datetime.utcnow()
+    )
+
+
+@app.post("/api/agent/heartbeat")
+def agent_heartbeat(
+    hostname: str = Query(..., description="服务器主机名"),
+    db: Session = Depends(get_db)
+):
+    """
+    Agent心跳接口
+    
+    Agent定期调用此接口更新在线状态。
+    
+    - **hostname**: 服务器主机名
+    """
+    server = db.query(Server).filter(Server.hostname == hostname).first()
+    
+    if not server:
+        raise HTTPException(
+            status_code=404,
+            detail=f"服务器 {hostname} 未注册"
+        )
+    
+    server.last_seen = datetime.utcnow()
+    server.status = "online"
+    db.commit()
+    
+    return {
+        "status": "ok",
+        "message": "心跳已接收",
+        "timestamp": datetime.utcnow()
+    }
+
+
+from fastapi import Request
+from fastapi.responses import PlainTextResponse, FileResponse
+from pathlib import Path
+
+AGENT_DIR = Path(__file__).parent.parent / "agent"
+
+
+def generate_deploy_script(server_url: str) -> str:
+    """
+    动态生成部署脚本，嵌入中央服务器地址
+    
+    Args:
+        server_url: 中央服务器地址 (如: http://192.168.1.100:8000)
+    
+    Returns:
+        生成的部署脚本内容
+    """
+    return f'''#!/bin/bash
+#
+# 服务器监控Agent一键部署脚本
+# 中央服务器: {server_url}
+#
+# 使用方法:
+#   curl -s {server_url}/deploy.sh | bash -s -- "服务器名称"
+#
+
+set -e
+
+# 颜色输出
+GREEN='\\033[0;32m'
+YELLOW='\\033[1;33m'
+RED='\\033[0;31m'
+NC='\\033[0m'
+
+# 日志函数
+info() {{
+    echo -e "${{GREEN}}[INFO]${{NC}} $1"
+}}
+
+warn() {{
+    echo -e "${{YELLOW}}[WARN]${{NC}} $1"
+}}
+
+error() {{
+    echo -e "${{RED}}[ERROR]${{NC}} $1"
+}}
+
+# 中央服务器地址（已嵌入）
+SCRIPT_SOURCE="{server_url}"
+
+# 服务器名称
+SERVER_NAME="$1"
+if [ -z "$SERVER_NAME" ]; then
+    SERVER_NAME=$(hostname)
+fi
+
+info "=========================================="
+info "  服务器监控Agent一键部署脚本"
+info "=========================================="
+info "中央服务器: $SCRIPT_SOURCE"
+info "服务器名称: $SERVER_NAME"
+info ""
+
+# 检查Python
+info "1. 检查Python环境..."
+if command -v python3 &> /dev/null; then
+    PYTHON=python3
+    info "  已找到 Python3: $($PYTHON --version)"
+elif command -v python &> /dev/null; then
+    PYTHON=python
+    PYTHON_VERSION=$($PYTHON --version 2>&1 | awk '{{print $2}}')
+    if [[ $PYTHON_VERSION == 3* ]]; then
+        info "  已找到 Python3: $PYTHON_VERSION"
+    else
+        error "需要 Python3，当前版本: $PYTHON_VERSION"
+        exit 1
+    fi
+else
+    error "未找到 Python，请先安装 Python3"
+    info "  Ubuntu/Debian: sudo apt install python3 python3-pip"
+    info "  CentOS/RHEL: sudo yum install python3 python3-pip"
+    exit 1
+fi
+
+# 检查pip
+info "2. 检查pip..."
+if command -v pip3 &> /dev/null; then
+    PIP=pip3
+elif command -v pip &> /dev/null; then
+    PIP=pip
+else
+    error "未找到 pip，请先安装"
+    exit 1
+fi
+info "  已找到 pip"
+
+# 安装psutil
+info "3. 安装依赖包 (psutil, requests)..."
+$PIP install psutil requests -q
+info "  依赖安装完成"
+
+# 下载Agent脚本
+info "4. 下载Agent脚本..."
+AGENT_DIR="/opt/monitor-agent"
+sudo mkdir -p $AGENT_DIR
+
+AGENT_URL="$SCRIPT_SOURCE/agent/agent.py"
+info "  从 $AGENT_URL 下载..."
+
+if command -v curl &> /dev/null; then
+    sudo curl -s -o "$AGENT_DIR/agent.py" "$AGENT_URL"
+elif command -v wget &> /dev/null; then
+    sudo wget -q -O "$AGENT_DIR/agent.py" "$AGENT_URL"
+else
+    error "需要 curl 或 wget"
+    exit 1
+fi
+
+sudo chmod +x "$AGENT_DIR/agent.py"
+info "  Agent脚本已保存到: $AGENT_DIR/agent.py"
+
+# 安装Systemd服务
+info "5. 安装Systemd服务..."
+
+HOSTNAME=$(hostname)
+IP_ADDRESS=$(hostname -I | awk '{{print $1}}')
+
+SERVICE_FILE="/etc/systemd/system/monitor-agent.service"
+
+# 创建服务文件
+sudo tee $SERVICE_FILE > /dev/null << EOF
+[Unit]
+Description=服务器监控Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$PYTHON $AGENT_DIR/agent.py --server $SCRIPT_SOURCE --hostname $HOSTNAME --name "$SERVER_NAME"
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+info "  服务文件已创建: $SERVICE_FILE"
+
+# 重载并启动服务
+info "6. 启动服务..."
+sudo systemctl daemon-reload
+sudo systemctl enable monitor-agent
+sudo systemctl start monitor-agent
+
+# 等待服务启动
+sleep 2
+
+# 检查服务状态
+if systemctl is-active --quiet monitor-agent; then
+    info "  服务启动成功"
+else
+    warn "  服务可能未正常启动，请检查日志"
+fi
+
+info ""
+info "=========================================="
+info "  部署完成！"
+info "=========================================="
+info ""
+info "服务管理命令:"
+info "  查看状态:  sudo systemctl status monitor-agent"
+info "  查看日志:  sudo journalctl -u monitor-agent -f"
+info "  重启服务:  sudo systemctl restart monitor-agent"
+info "  停止服务:  sudo systemctl stop monitor-agent"
+info ""
+info "配置文件: /etc/monitor-agent/config.json"
+info "Agent脚本: $AGENT_DIR/agent.py"
+info ""
+info "中央服务器: $SCRIPT_SOURCE"
+info "本机主机名: $HOSTNAME"
+info "本机IP: $IP_ADDRESS"
+info ""
+'''
+
+
+@app.get("/deploy.sh", response_class=PlainTextResponse)
+def get_deploy_script(request: Request):
+    """
+    提供一键部署脚本下载
+    
+    脚本会动态嵌入中央服务器地址，用户只需执行：
+    curl -s http://<中央服务器>:8000/deploy.sh | bash -s -- "服务器名称"
+    
+    例如:
+    curl -s http://192.168.1.100:8000/deploy.sh | bash -s -- "Web服务器01"
+    """
+    server_url = str(request.base_url).rstrip('/')
+    
+    deploy_script = AGENT_DIR / "deploy.sh"
+    
+    if not deploy_script.exists():
+        script_content = generate_deploy_script(server_url)
+    else:
+        script_content = generate_deploy_script(server_url)
+    
+    return PlainTextResponse(
+        content=script_content,
+        media_type="text/x-shellscript"
+    )
+
+
+@app.get("/agent/agent.py")
+def get_agent_script():
+    """
+    提供Agent脚本下载
+    """
+    agent_script = AGENT_DIR / "agent.py"
+    
+    if not agent_script.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Agent脚本不存在"
+        )
+    
+    return FileResponse(
+        path=str(agent_script),
+        media_type="text/x-python",
+        filename="agent.py"
+    )
